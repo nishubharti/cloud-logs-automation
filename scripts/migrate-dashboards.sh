@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 # -----------------------------
@@ -26,37 +25,41 @@ fi
 # -----------------------------
 # Generate Bearer Token
 # -----------------------------
-echo "Generating Bearer token..."
+echo "Generating IAM access token..."
 
-TOKEN_RESPONSE=$(curl -s -X POST \
+ACCESS_TOKEN=$(curl -s -X POST \
   "https://iam.cloud.ibm.com/identity/token" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --data-urlencode "grant_type=urn:ibm:params:oauth:grant-type:apikey" \
-  --data-urlencode "apikey=${IBM_CLOUD_API_KEY}")
-
-ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+  --data-urlencode "apikey=${IBM_CLOUD_API_KEY}" \
+  | jq -r '.access_token')
 
 if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
   echo "ERROR: Failed to generate access token"
-  echo "$TOKEN_RESPONSE"
   exit 1
 fi
 
 AUTH_HEADER="Authorization: Bearer ${ACCESS_TOKEN}"
 
-# -----------------------------
-# Fetch dashboards from source
-# -----------------------------
-SOURCE_URL="https://${SOURCE_ID}.api.${SOURCE_REGION}.logs.cloud.ibm.com/v1/dashboards"
+SOURCE_BASE_URL="https://${SOURCE_ID}.api.${SOURCE_REGION}.logs.cloud.ibm.com/v1"
+TARGET_BASE_URL="https://${TARGET_ID}.api.${TARGET_REGION}.logs.cloud.ibm.com/v1"
 
-echo "Fetching dashboards from source: $SOURCE_URL"
+# -----------------------------
+# Folder name → target folder id map
+# -----------------------------
+declare -A FOLDER_MAP
 
-DASHBOARD_RESPONSE=$(curl -s \
+# -----------------------------
+# Fetch dashboards (LIST contains folder info)
+# -----------------------------
+echo "Fetching dashboards from source..."
+
+DASHBOARD_LIST=$(curl -s \
   -H "Content-Type: application/json" \
   -H "$AUTH_HEADER" \
-  "$SOURCE_URL")
+  "${SOURCE_BASE_URL}/dashboards")
 
-DASHBOARD_COUNT=$(echo "$DASHBOARD_RESPONSE" | jq '.dashboards | length')
+DASHBOARD_COUNT=$(echo "$DASHBOARD_LIST" | jq '.dashboards | length')
 
 if [[ "$DASHBOARD_COUNT" -eq 0 ]]; then
   echo "No dashboards found in source."
@@ -64,45 +67,86 @@ if [[ "$DASHBOARD_COUNT" -eq 0 ]]; then
 fi
 
 echo "Found $DASHBOARD_COUNT dashboards."
-
-# -----------------------------
-# Post dashboards to target
-# -----------------------------
-TARGET_URL="https://${TARGET_ID}.api.${TARGET_REGION}.logs.cloud.ibm.com/v1/dashboards"
-
-echo "Migrating dashboards to target: $TARGET_URL"
 echo
 
-echo "$DASHBOARD_RESPONSE" | jq -c '.dashboards[]' | while read -r dashboard; do
-  NAME=$(echo "$dashboard" | jq -r '.name')
+# -----------------------------
+# Migrate dashboards
+# -----------------------------
+echo "$DASHBOARD_LIST" | jq -c '.dashboards[]' | while read -r DASH; do
+  DASHBOARD_ID=$(echo "$DASH" | jq -r '.id')
+  DASHBOARD_NAME=$(echo "$DASH" | jq -r '.name // "unknown"')
+  FOLDER_NAME=$(echo "$DASH" | jq -r '.folder.name // empty')
 
-  echo "Migrating dashboard: $NAME"
+  echo "Processing dashboard: $DASHBOARD_NAME"
+  echo "→ Source dashboard ID: $DASHBOARD_ID"
 
-  # Remove fields that should not be sent on create
-  PAYLOAD=$(echo "$dashboard" | jq 'del(
-      .id,
-      .create_time,
-      .update_time,
-      .is_default,
-      .is_pinned
-    )')
+  TARGET_FOLDER_ID=""
 
-  echo ${PAYLOAD}
+  # -----------------------------
+  # Create folder on target (if needed)
+  # -----------------------------
+  if [[ -n "$FOLDER_NAME" ]]; then
+    if [[ -n "${FOLDER_MAP[$FOLDER_NAME]:-}" ]]; then
+      TARGET_FOLDER_ID="${FOLDER_MAP[$FOLDER_NAME]}"
+    else
+      echo "→ Creating folder on target: $FOLDER_NAME"
 
+      FOLDER_RESPONSE=$(curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -H "$AUTH_HEADER" \
+        -d "$(jq -n --arg name "$FOLDER_NAME" '{name: $name}')" \
+        "${TARGET_BASE_URL}/folders")
+
+      TARGET_FOLDER_ID=$(echo "$FOLDER_RESPONSE" | jq -r '.id')
+
+      if [[ -z "$TARGET_FOLDER_ID" || "$TARGET_FOLDER_ID" == "null" ]]; then
+        echo "✖ Failed to create folder: $FOLDER_NAME"
+        echo "$FOLDER_RESPONSE"
+        continue
+      fi
+
+      FOLDER_MAP["$FOLDER_NAME"]="$TARGET_FOLDER_ID"
+      echo "✔ Folder created with ID: $TARGET_FOLDER_ID"
+    fi
+  fi
+
+  # -----------------------------
+  # GET dashboard by ID
+  # -----------------------------
+  DASHBOARD=$(curl -s \
+    -H "Content-Type: application/json" \
+    -H "$AUTH_HEADER" \
+    "${SOURCE_BASE_URL}/dashboards/${DASHBOARD_ID}")
+
+  # -----------------------------
+  # Remove id and update folder.id
+  # -----------------------------
+  if [[ -n "$TARGET_FOLDER_ID" ]]; then
+  PAYLOAD=$(echo "$DASHBOARD" | jq \
+    --arg folder_id "$TARGET_FOLDER_ID" \
+    'del(.id, .folder) | .folder_id.value = $folder_id')
+  else
+  PAYLOAD=$(echo "$DASHBOARD" | jq 'del(.id, .folder)')
+  fi
+
+
+  # -----------------------------
+  # POST dashboard to target
+  # -----------------------------
   RESPONSE=$(curl -s -X POST \
     -H "Content-Type: application/json" \
     -H "$AUTH_HEADER" \
     -d "$PAYLOAD" \
-    "$TARGET_URL")
+    "${TARGET_BASE_URL}/dashboards")
 
   if echo "$RESPONSE" | jq -e '.id' >/dev/null 2>&1; then
-    echo "✔ Successfully created: $NAME"
+    echo "✔ Successfully migrated: $DASHBOARD_NAME"
   else
-    echo "✖ Failed to create: $NAME"
+    echo "✖ Failed to migrate: $DASHBOARD_NAME"
     echo "$RESPONSE"
   fi
 
-  echo
+  echo "----------------------------------------"
 done
 
-echo "Dashboard migration completed."
+echo "✅ Dashboard migration completed."
